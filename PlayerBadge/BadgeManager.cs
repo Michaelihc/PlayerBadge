@@ -2,31 +2,29 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using Exiled.API.Features;
-using MEC;
+using LabApi.Features.Console;
+using LabApi.Features.Wrappers;
+using LabApi.Loader;
 
 namespace PlayerBadge
 {
     public class BadgeManager
     {
-        private List<BadgeData> _badges = new List<BadgeData>();
-
-        private HashSet<Player> _rainbowPlayers = new HashSet<Player>();
-
-        private CoroutineHandle _rainbowCoroutine;
-
+        private readonly List<BadgeData> _badges = new List<BadgeData>();
+        private readonly HashSet<string> _rainbowPlayers = new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, OriginalBadge> _originalBadges = new Dictionary<string, OriginalBadge>(StringComparer.Ordinal);
         private readonly string[] _availableColors = { "red", "yellow", "cyan", "green", "aqua", "pink", "white", "orange" };
 
-        private int _currentColorIndex = 0;
+        private float _accumulator;
+        private int _currentColorIndex;
 
         public void LoadBadges()
         {
             try
             {
-                var configPath = PlayerBadge.Instance.Config.ConfigFilePath;
-
-                var directory = Path.GetDirectoryName(configPath);
-                if (!Directory.Exists(directory))
+                string configPath = GetConfigPath();
+                string directory = Path.GetDirectoryName(configPath);
+                if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
                 {
                     Directory.CreateDirectory(directory);
                 }
@@ -36,160 +34,305 @@ namespace PlayerBadge
                     CreateExampleConfigFile(configPath);
                 }
 
-                var lines = File.ReadAllLines(configPath);
                 _badges.Clear();
-
-                foreach (var line in lines)
+                foreach (string line in File.ReadAllLines(configPath))
                 {
-                    var badge = BadgeData.ParseFromConfigLine(line);
-                    if (badge != null)
+                    BadgeData badge = BadgeData.ParseFromConfigLine(line);
+                    if (badge == null)
                     {
-                        _badges.Add(badge);
-                        if (PlayerBadge.Instance.Config.Debug)
-                        {
-                            Log.Debug($"加载称号: {badge}");
-                        }
+                        continue;
+                    }
+
+                    _badges.Add(badge);
+                    if (PlayerBadgePlugin.Instance.Config.Debug)
+                    {
+                        Logger.Debug($"[PlayerBadge] Loaded title: {badge}");
                     }
                 }
 
-                Log.Debug($"成功加载 {_badges.Count} 个玩家称号配置");
-
-                StartRainbowBadges();
+                Logger.Info(PlayerBadgePlugin.Instance.Text(
+                    $"Loaded {_badges.Count} custom title entries.",
+                    $"已加载 {_badges.Count} 条自定义称号配置。"));
             }
             catch (Exception ex)
             {
-                Log.Error($"加载称号配置时发生错误: {ex.Message}");
+                Logger.Error(PlayerBadgePlugin.Instance.Text(
+                    $"Failed to load title config: {ex.Message}",
+                    $"加载称号配置失败：{ex.Message}"));
             }
-        }
-
-        private void CreateExampleConfigFile(string configPath)
-        {
-            var exampleContent = @"# PlayerBadge 配置文件
-# 格式: 玩家ID@平台:颜色:称号内容
-# 支持的平台: steam, discord
-# 支持的颜色: red, yellow, cyan, green, aqua, pink, white, orange, rainbow
-# 示例:
-# 76561198000000000@steam:red:管理员
-# 123456789@discord:rainbow:VIP玩家
-# 76561198111111111@steam:green:测试员
-
-# 在此添加您的玩家称号配置
-";
-            File.WriteAllText(configPath, exampleContent);
-            Log.Info($"已创建示例配置文件: {configPath}");
         }
 
         public void ApplyBadgeToPlayer(Player player)
         {
-            if (player == null)
+            if (player == null || string.IsNullOrWhiteSpace(player.UserId))
+            {
                 return;
+            }
 
             try
             {
-                var badge = GetBadgeForPlayer(player);
-                if (badge != null)
+                BadgeData badge = _badges.FirstOrDefault(entry => entry.MatchesPlayer(player));
+                if (badge == null)
                 {
-                    if (badge.IsRainbow)
-                    {
-                        _rainbowPlayers.Add(player);
-                        player.RankName = badge.Text;
-                        player.RankColor = _availableColors[_currentColorIndex];
-                        
-                        if (PlayerBadge.Instance.Config.Debug)
-                        {
-                            Log.Debug($"为玩家 {player.Nickname} 应用彩色称号: {badge.Text}");
-                        }
-                    }
-                    else
-                    {
-                        player.RankName = badge.Text;
-                        player.RankColor = badge.Color;
-                        
-                        if (PlayerBadge.Instance.Config.Debug)
-                        {
-                            Log.Debug($"为玩家 {player.Nickname} 应用称号: {badge.Text} ({badge.Color})");
-                        }
-                    }
+                    RestorePlayer(player);
+                    return;
+                }
 
+                StoreOriginal(player);
+                player.GroupName = badge.DisplayText;
+                player.GroupColor = badge.IsRainbow
+                    ? _availableColors[_currentColorIndex]
+                    : badge.UsesInlineColors
+                        ? "white"
+                        : badge.Color;
 
+                if (badge.IsRainbow)
+                {
+                    _rainbowPlayers.Add(player.UserId);
+                }
+                else
+                {
+                    _rainbowPlayers.Remove(player.UserId);
+                }
+
+                if (PlayerBadgePlugin.Instance.Config.Debug)
+                {
+                    Logger.Debug($"[PlayerBadge] Applied title to {player.LogName}: {badge}");
                 }
             }
             catch (Exception ex)
             {
-                Log.Error($"为玩家 {player?.Nickname} 应用称号时发生错误: {ex.Message}");
+                Logger.Error(PlayerBadgePlugin.Instance.Text(
+                    $"Failed to apply title to {player?.LogName}: {ex.Message}",
+                    $"为玩家 {player?.LogName} 应用称号失败：{ex.Message}"));
             }
         }
 
-        private BadgeData GetBadgeForPlayer(Player player)
+        public void RemoveRainbowPlayer(Player player)
         {
-            return _badges.FirstOrDefault(badge => badge.MatchesPlayer(player));
-        }
-
-        private void StartRainbowBadges()
-        {
-            if (_rainbowCoroutine.IsRunning)
-                Timing.KillCoroutines(_rainbowCoroutine);
-
-            _rainbowCoroutine = Timing.RunCoroutine(RainbowBadgeCoroutine());
-        }
-
-        public void StopRainbowBadges()
-        {
-            if (_rainbowCoroutine.IsRunning)
-                Timing.KillCoroutines(_rainbowCoroutine);
-            
-            _rainbowPlayers.Clear();
-        }
-
-        private IEnumerator<float> RainbowBadgeCoroutine()
-        {
-            while (true)
+            if (!string.IsNullOrWhiteSpace(player?.UserId))
             {
-                yield return Timing.WaitForSeconds(PlayerBadge.Instance.Config.RainbowInterval);
-
-                if (_rainbowPlayers.Count > 0)
-                {
-                    _currentColorIndex = (_currentColorIndex + 1) % _availableColors.Length;
-                    var currentColor = _availableColors[_currentColorIndex];
-
-                    var playersToRemove = new List<Player>();
-                    foreach (var player in _rainbowPlayers)
-                    {
-                        if (player == null || !player.IsConnected)
-                        {
-                            playersToRemove.Add(player);
-                            continue;
-                        }
-
-                        try
-                        {
-                            player.RankColor = currentColor;
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.Error($"更新玩家 {player.Nickname} 彩色称号时发生错误: {ex.Message}");
-                            playersToRemove.Add(player);
-                        }
-                    }
-
-                    foreach (var player in playersToRemove)
-                    {
-                        _rainbowPlayers.Remove(player);
-                    }
-                }
+                _rainbowPlayers.Remove(player.UserId);
             }
         }
 
         public void ReloadConfig()
         {
-            Log.Debug("正在重新加载称号配置...");
-            StopRainbowBadges();
+            _rainbowPlayers.Clear();
             LoadBadges();
+            foreach (Player player in Player.ReadyList)
+            {
+                ApplyBadgeToPlayer(player);
+            }
         }
 
-        public void RemoveRainbowPlayer(Player player)
+        public bool SetBadge(string playerIdentifier, string color, string text, out string normalizedIdentifier, out string error)
         {
-            _rainbowPlayers.Remove(player);
+            normalizedIdentifier = NormalizeIdentifier(playerIdentifier);
+            error = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(normalizedIdentifier))
+            {
+                error = "Player identifier cannot be empty.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(color))
+            {
+                error = "Color cannot be empty.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                error = "Title text cannot be empty.";
+                return false;
+            }
+
+            string configPath = GetConfigPath();
+            EnsureConfigFile(configPath);
+            List<string> lines = File.ReadAllLines(configPath).ToList();
+            string identifier = normalizedIdentifier;
+            lines.RemoveAll(line => IsMatchingConfiguredIdentifier(line, identifier));
+            lines.Add($"{normalizedIdentifier}:{color.Trim()}:{text.Trim()}");
+            File.WriteAllLines(configPath, lines);
+            ReloadConfig();
+            return true;
+        }
+
+        public bool RemoveBadge(string playerIdentifier, out string normalizedIdentifier)
+        {
+            normalizedIdentifier = NormalizeIdentifier(playerIdentifier);
+            if (string.IsNullOrWhiteSpace(normalizedIdentifier))
+            {
+                return false;
+            }
+
+            string configPath = GetConfigPath();
+            EnsureConfigFile(configPath);
+            List<string> lines = File.ReadAllLines(configPath).ToList();
+            string identifier = normalizedIdentifier;
+            int removed = lines.RemoveAll(line => IsMatchingConfiguredIdentifier(line, identifier));
+            if (removed <= 0)
+            {
+                return false;
+            }
+
+            File.WriteAllLines(configPath, lines);
+            ReloadConfig();
+            return true;
+        }
+
+        public IReadOnlyList<BadgeData> GetBadgesSnapshot()
+        {
+            return _badges.ToList();
+        }
+
+        public string GetBadgeFilePath()
+        {
+            return GetConfigPath();
+        }
+
+        public void Tick(float deltaSeconds)
+        {
+            if (_rainbowPlayers.Count == 0)
+            {
+                return;
+            }
+
+            _accumulator += deltaSeconds;
+            float interval = Math.Max(0.1f, PlayerBadgePlugin.Instance.Config.RainbowInterval);
+            if (_accumulator < interval)
+            {
+                return;
+            }
+
+            _accumulator = 0f;
+            _currentColorIndex = (_currentColorIndex + 1) % _availableColors.Length;
+            string color = _availableColors[_currentColorIndex];
+
+            foreach (Player player in Player.ReadyList)
+            {
+                if (_rainbowPlayers.Contains(player.UserId))
+                {
+                    player.GroupColor = color;
+                }
+            }
+        }
+
+        public void RestoreAll()
+        {
+            foreach (Player player in Player.ReadyList)
+            {
+                RestorePlayer(player);
+            }
+
+            _rainbowPlayers.Clear();
+            _originalBadges.Clear();
+        }
+
+        private void RestorePlayer(Player player)
+        {
+            if (player == null || string.IsNullOrWhiteSpace(player.UserId))
+            {
+                return;
+            }
+
+            if (_originalBadges.TryGetValue(player.UserId, out OriginalBadge original))
+            {
+                player.GroupName = original.Name;
+                player.GroupColor = original.Color;
+                _originalBadges.Remove(player.UserId);
+            }
+
+            _rainbowPlayers.Remove(player.UserId);
+        }
+
+        private void StoreOriginal(Player player)
+        {
+            if (!_originalBadges.ContainsKey(player.UserId))
+            {
+                _originalBadges[player.UserId] = new OriginalBadge(player.GroupName, player.GroupColor);
+            }
+        }
+
+        private string GetConfigPath()
+        {
+            string configured = PlayerBadgePlugin.Instance.Config.ConfigFilePath;
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                return configured;
+            }
+
+            return Path.Combine(PlayerBadgePlugin.Instance.GetConfigDirectory().FullName, "PlayerBadge.txt");
+        }
+
+        private static string NormalizeIdentifier(string playerIdentifier)
+        {
+            string value = (playerIdentifier ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            return value.Contains("@") ? value : value + "@any";
+        }
+
+        private static bool IsMatchingConfiguredIdentifier(string configLine, string normalizedIdentifier)
+        {
+            BadgeData badge = BadgeData.ParseFromConfigLine(configLine);
+            if (badge == null)
+            {
+                return false;
+            }
+
+            string candidate = NormalizeIdentifier($"{badge.PlayerId}@{badge.Platform}");
+            return string.Equals(candidate, normalizedIdentifier, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void EnsureConfigFile(string configPath)
+        {
+            string directory = Path.GetDirectoryName(configPath);
+            if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            if (!File.Exists(configPath))
+            {
+                CreateExampleConfigFile(configPath);
+            }
+        }
+
+        private void CreateExampleConfigFile(string configPath)
+        {
+            string exampleContent = @"# PlayerBadge config / PlayerBadge 配置文件
+# Format / 格式: playerId@platform:color:title
+# Platforms / 平台: steam, discord, any
+# Colors / 颜色: red, yellow, cyan, green, aqua, pink, white, orange, rainbow, multi, rich
+# Examples / 示例:
+# 76561198000000000@steam:red:Admin
+# 123456789@discord:rainbow:VIP
+# 76561198111111111@steam:multi:red=Admin|cyan=Helper
+# 76561198222222222@steam:rich:<color=#ff5577>Pink</color><color=#55ddff>Blue</color>
+";
+            File.WriteAllText(configPath, exampleContent);
+            Logger.Info(PlayerBadgePlugin.Instance.Text(
+                $"Created example title config: {configPath}",
+                $"已创建示例称号配置：{configPath}"));
+        }
+
+        private readonly struct OriginalBadge
+        {
+            public OriginalBadge(string name, string color)
+            {
+                Name = name ?? string.Empty;
+                Color = color ?? string.Empty;
+            }
+
+            public string Name { get; }
+
+            public string Color { get; }
         }
     }
 }

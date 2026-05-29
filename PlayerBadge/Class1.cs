@@ -1,12 +1,19 @@
-﻿using System;
-using Exiled.API.Features;
-using Exiled.API.Interfaces;
+using System;
+using LabApi.Events.Handlers;
+using LabApi.Features;
+using LabApi.Features.Wrappers;
+using LabApi.Loader.Features.Plugins;
+using SimpleHints.Api;
+using UnityEngine;
+using Logger = LabApi.Features.Console.Logger;
 
 namespace PlayerBadge
 {
-    public class PlayerBadge : Plugin<Config>
+    public class PlayerBadgePlugin : Plugin<Config>
     {
-        public static PlayerBadge Instance { get; private set; }
+        private GameObject _runnerObject;
+
+        public static PlayerBadgePlugin Instance { get; private set; }
 
         public EventHandlers EventHandlers { get; private set; }
 
@@ -14,40 +21,90 @@ namespace PlayerBadge
 
         public override string Name => "PlayerBadge";
 
-        public override string Author => "kldhsh123";
+        public override string Description => "Localized LabAPI custom title and rainbow title plugin.";
 
-        public override Version Version => new Version(1, 0, 0);
+        public override string Author => "kldhsh123, LabAPI migration by Codex";
 
-        public override void OnEnabled()
+        public override Version Version => new Version(2, 0, 0);
+
+        public override Version RequiredApiVersion => new Version(LabApiProperties.CompiledVersion);
+
+        public override LabApi.Loader.Features.Plugins.Enums.LoadPriority Priority => LabApi.Loader.Features.Plugins.Enums.LoadPriority.Low;
+
+        public override void Enable()
         {
             Instance = this;
+            Logger.Info($"[PlayerBadge] SimpleHints dependency ready={SimpleHintsApi.IsReady}.");
+
+            if (!Config.IsEnabled)
+            {
+                Logger.Info("[PlayerBadge] Disabled by config.");
+                return;
+            }
 
             BadgeManager = new BadgeManager();
+            BadgeManager.LoadBadges();
 
             EventHandlers = new EventHandlers();
+            PlayerEvents.Joined += EventHandlers.OnPlayerJoined;
+            PlayerEvents.Left += EventHandlers.OnPlayerLeft;
+            ServerEvents.WaitingForPlayers += EventHandlers.OnWaitingForPlayers;
 
-            Exiled.Events.Handlers.Player.Verified += EventHandlers.OnPlayerVerified;
-            Exiled.Events.Handlers.Player.Left += EventHandlers.OnPlayerLeft;
-            Exiled.Events.Handlers.Server.WaitingForPlayers += EventHandlers.OnWaitingForPlayers;
+            _runnerObject = new GameObject("PlayerBadge LabAPI Runner");
+            UnityEngine.Object.DontDestroyOnLoad(_runnerObject);
+            _runnerObject.AddComponent<PlayerBadgeUpdateBehaviour>().Initialize(BadgeManager);
 
-            Log.Info("PlayerBadge插件已启用！");
-            base.OnEnabled();
+            foreach (Player player in Player.ReadyList)
+            {
+                BadgeManager.ApplyBadgeToPlayer(player);
+            }
+
+            Logger.Info(Text("PlayerBadge enabled.", "PlayerBadge 插件已启用。"));
         }
 
-        public override void OnDisabled()
+        public override void Disable()
         {
-            Exiled.Events.Handlers.Player.Verified -= EventHandlers.OnPlayerVerified;
-            Exiled.Events.Handlers.Player.Left -= EventHandlers.OnPlayerLeft;
-            Exiled.Events.Handlers.Server.WaitingForPlayers -= EventHandlers.OnWaitingForPlayers;
+            if (EventHandlers != null)
+            {
+                PlayerEvents.Joined -= EventHandlers.OnPlayerJoined;
+                PlayerEvents.Left -= EventHandlers.OnPlayerLeft;
+                ServerEvents.WaitingForPlayers -= EventHandlers.OnWaitingForPlayers;
+            }
 
-            BadgeManager?.StopRainbowBadges();
+            if (_runnerObject != null)
+            {
+                UnityEngine.Object.Destroy(_runnerObject);
+                _runnerObject = null;
+            }
+
+            BadgeManager?.RestoreAll();
 
             EventHandlers = null;
             BadgeManager = null;
             Instance = null;
 
-            Log.Info("PlayerBadge插件已禁用！");
-            base.OnDisabled();
+            Logger.Info("[PlayerBadge] Disabled.");
+        }
+
+        internal string Text(string english, string chinese)
+        {
+            string language = (Config.Language ?? string.Empty).Trim().ToLowerInvariant();
+            return language == "en" ? english : chinese;
+        }
+    }
+
+    internal sealed class PlayerBadgeUpdateBehaviour : MonoBehaviour
+    {
+        private BadgeManager _manager;
+
+        public void Initialize(BadgeManager manager)
+        {
+            _manager = manager;
+        }
+
+        private void Update()
+        {
+            _manager?.Tick(Time.unscaledDeltaTime);
         }
     }
 }
